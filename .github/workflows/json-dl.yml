@@ -1,0 +1,104 @@
+name: json-dl multi-platform
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['json-dl/**', 'libdl/**', 'Cargo.*', 'scripts/**', 'docs/json-dl.md', 'LICENSE', '.github/workflows/json-dl.yml']
+  push:
+    branches: [main]
+    paths: ['json-dl/**', 'libdl/**', 'Cargo.*', 'scripts/**', 'docs/json-dl.md', 'LICENSE', '.github/workflows/json-dl.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, rustflags: '-C target-feature=+crt-static', exe: '.exe' }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, rustflags: '-C target-feature=+crt-static', exe: '.exe' }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-musl, musl: true }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: macos-15, target: aarch64-apple-darwin }
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: ${{ matrix.rustflags || '' }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: json-dl-${{ matrix.target }}
+      - name: Install native musl compiler
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC=musl-gcc" >> "$GITHUB_ENV"
+      - name: Unit tests
+        run: cargo test --locked -p json-dl -p libdl --no-default-features --target ${{ matrix.target }}
+      - name: Build HTTP-only release
+        run: cargo build --locked --release -p json-dl --target ${{ matrix.target }}
+      - name: Protocol and HTTP integration tests
+        run: python scripts/test-json-dl.py target/${{ matrix.target }}/release/json-dl${{ matrix.exe }}
+      - name: Package binary, license, protocol and checksums
+        run: python scripts/package-json-dl.py --target ${{ matrix.target }} --binary target/${{ matrix.target }}/release/json-dl${{ matrix.exe }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: json-dl-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos-universal:
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: json-dl-*-apple-darwin
+          path: inputs
+      - name: Assemble and ad-hoc sign Universal Binary
+        shell: bash
+        run: |
+          mkdir -p universal/x86_64 universal/aarch64
+          tar -xzf inputs/json-dl-x86_64-apple-darwin/*.tar.gz -C universal/x86_64
+          tar -xzf inputs/json-dl-aarch64-apple-darwin/*.tar.gz -C universal/aarch64
+          lipo -create universal/x86_64/json-dl universal/aarch64/json-dl -output universal/json-dl
+          codesign --force --sign - universal/json-dl
+          lipo -verify_arch x86_64 arm64 universal/json-dl
+          codesign --verify --strict universal/json-dl
+          python scripts/test-json-dl.py universal/json-dl
+          python scripts/package-json-dl.py --target universal-apple-darwin --binary universal/json-dl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: json-dl-universal-apple-darwin
+          path: dist/*
+          if-no-files-found: error
+
+  upstream-cli:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p dl

@@ -4,3 +4,8 @@
 *.part
 *.tmp
 .DS_Store
+
+/dist/
+*.json-dl.lock
+*.json-dl-part
+*.json-dl-part.dl

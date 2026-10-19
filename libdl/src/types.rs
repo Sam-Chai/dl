@@ -23,6 +23,13 @@ pub struct DownloadOptions {
     pub metadata_flush_interval: Duration,
     pub progress: Option<ProgressSender>,
     pub only_files: Option<Vec<usize>>,
+    /// Applied to every HTTP probe and payload request.
+    pub headers: reqwest::header::HeaderMap,
+    pub cancellation: Option<crate::DownloadCancellation>,
+    /// Optional content identity, e.g. an expected SHA-256, required to reuse state.
+    pub resume_key: Option<String>,
+    /// Restrict automatic redirects to the original origin when passing credentials.
+    pub same_origin_redirects: bool,
 }
 
 impl Default for DownloadOptions {
@@ -36,6 +43,10 @@ impl Default for DownloadOptions {
             metadata_flush_interval: DEFAULT_METADATA_FLUSH_INTERVAL,
             progress: None,
             only_files: None,
+            headers: reqwest::header::HeaderMap::new(),
+            cancellation: None,
+            resume_key: None,
+            same_origin_redirects: false,
         }
     }
 }
@@ -116,6 +127,8 @@ pub struct InlineDownloadState {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub updated_at_unix_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_key: Option<String>,
 }
 
 pub(crate) fn urls_are_compatible(url1: &str, url2: &str) -> bool {
@@ -159,6 +172,7 @@ impl InlineDownloadState {
             etag,
             last_modified,
             updated_at_unix_secs: unix_now(),
+            resume_key: None,
         }
     }
 
@@ -242,7 +256,7 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Generate a unique output path by appending a numeric suffix (e.g., `.1`, `.2`) 
+/// Generate a unique output path by appending a numeric suffix (e.g., `.1`, `.2`)
 /// if the desired path already exists.
 pub fn generate_unique_output_path(path: &Path) -> PathBuf {
     if !path.exists() {
@@ -261,10 +275,7 @@ pub fn generate_unique_output_path(path: &Path) -> PathBuf {
 
 /// Determine the target output path and the temporary download path.
 /// If overwrite is disabled and a download path already exists, we resume it.
-pub fn determine_download_paths(
-    output_path: &Path,
-    overwrite: bool,
-) -> (PathBuf, PathBuf) {
+pub fn determine_download_paths(output_path: &Path, overwrite: bool) -> (PathBuf, PathBuf) {
     let target_path = output_path.to_path_buf();
     let download_path = get_download_path(&target_path);
 

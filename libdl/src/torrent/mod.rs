@@ -1,11 +1,16 @@
-use std::{path::Path, time::Duration};
+use std::path::Path;
+#[cfg(feature = "torrent")]
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{DlError, Result},
-    types::{DownloadKind, DownloadPhase, DownloadProgress, DownloadSummary, ProgressSender},
+    types::{DownloadSummary, ProgressSender},
 };
+
+#[cfg(feature = "torrent")]
+use crate::types::{DownloadKind, DownloadPhase, DownloadProgress};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TorrentInput {

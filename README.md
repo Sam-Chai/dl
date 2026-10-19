@@ -182,3 +182,7 @@ For more options (like benchmarking a custom URL), run:
 ## 📄 License
 
 This project is licensed under MIT License. See the [LICENSE](LICENSE) file for details.
+
+## json-dl for launcher integration
+
+This fork also provides an HTTP-only `json-dl` binary with JSON Lines events, stdin requests/cancellation, authentication headers, verified publication and multi-platform builds. The original `dl` CLI remains available. See [the json-dl protocol and build guide](docs/json-dl.md).

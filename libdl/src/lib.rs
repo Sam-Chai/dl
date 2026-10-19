@@ -1,3 +1,4 @@
+pub mod cancellation;
 pub mod error;
 pub mod http;
 pub mod state;
@@ -6,6 +7,7 @@ pub mod types;
 
 use std::path::Path;
 
+pub use cancellation::DownloadCancellation;
 pub use error::{DlError, Result};
 pub use http::download_http;
 pub use torrent::{download_torrent, list_torrent_files, TorrentInput, TorrentOptions};

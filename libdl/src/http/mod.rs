@@ -24,8 +24,8 @@ use crate::{
     error::{DlError, Result},
     state::{clear_inline_state, read_inline_state, write_inline_state},
     types::{
-        build_segments, chunk_count, DownloadKind, DownloadOptions, DownloadPhase,
-        DownloadProgress, DownloadSummary, InlineDownloadState, ProgressSender, Segment, segment_len,
+        build_segments, chunk_count, segment_len, DownloadKind, DownloadOptions, DownloadPhase,
+        DownloadProgress, DownloadSummary, InlineDownloadState, ProgressSender, Segment,
     },
 };
 
@@ -79,7 +79,8 @@ impl DynamicScaler {
             return None;
         }
 
-        let current_speed = (current_bytes.saturating_sub(self.last_bytes)) as f64 / elapsed.as_secs_f64();
+        let current_speed =
+            (current_bytes.saturating_sub(self.last_bytes)) as f64 / elapsed.as_secs_f64();
         self.last_bytes = current_bytes;
         self.last_time = Instant::now();
 
@@ -102,7 +103,10 @@ impl DynamicScaler {
                         let start_id = self.next_worker_id;
                         self.next_worker_id += increase;
                         self.current_worker_count += increase;
-                        return Some(ScalerAction::ScaleUp { count: increase, start_id });
+                        return Some(ScalerAction::ScaleUp {
+                            count: increase,
+                            start_id,
+                        });
                     }
                 }
             }
@@ -123,11 +127,17 @@ impl DynamicScaler {
                         if self.current_worker_count < self.max_workers {
                             let increase = 2.min(self.max_workers - self.current_worker_count);
                             if increase > 0 {
-                                tracing::info!("Scaling up worker count to {}.", self.current_worker_count + increase);
+                                tracing::info!(
+                                    "Scaling up worker count to {}.",
+                                    self.current_worker_count + increase
+                                );
                                 let start_id = self.next_worker_id;
                                 self.next_worker_id += increase;
                                 self.current_worker_count += increase;
-                                return Some(ScalerAction::ScaleUp { count: increase, start_id });
+                                return Some(ScalerAction::ScaleUp {
+                                    count: increase,
+                                    start_id,
+                                });
                             }
                         }
                     } else {
@@ -141,15 +151,22 @@ impl DynamicScaler {
                         );
 
                         if self.consecutive_no_improvement == 1 {
-                            let decrease = 2.min(self.current_worker_count.saturating_sub(self.min_workers));
+                            let decrease =
+                                2.min(self.current_worker_count.saturating_sub(self.min_workers));
                             if decrease > 0 {
-                                tracing::info!("Scaling back down to {} workers to prevent congestion.", self.current_worker_count - decrease);
+                                tracing::info!(
+                                    "Scaling back down to {} workers to prevent congestion.",
+                                    self.current_worker_count - decrease
+                                );
                                 self.current_worker_count -= decrease;
                                 self.last_speed = None;
                                 return Some(ScalerAction::ScaleDown { count: decrease });
                             }
                         } else {
-                            tracing::info!("Dynamic worker scaling: Speed stabilized with {} workers.", self.current_worker_count);
+                            tracing::info!(
+                                "Dynamic worker scaling: Speed stabilized with {} workers.",
+                                self.current_worker_count
+                            );
                         }
                     }
                 } else {
@@ -182,6 +199,7 @@ struct WorkerContext {
     etag: Option<String>,
     last_modified: Option<String>,
     extra_workers_to_stop: Arc<AtomicUsize>,
+    resume_key: Option<String>,
 }
 
 pub async fn download_http(
@@ -190,10 +208,38 @@ pub async fn download_http(
     options: DownloadOptions,
 ) -> Result<DownloadSummary> {
     let url = url.into();
-    let (target_path, download_path) = crate::types::determine_download_paths(output.as_ref(), options.overwrite);
+    let (target_path, download_path) =
+        crate::types::determine_download_paths(output.as_ref(), options.overwrite);
     let mut options = options.normalized();
 
+    if options
+        .cancellation
+        .as_ref()
+        .is_some_and(|c| c.is_cancelled())
+    {
+        return Err(DlError::Cancelled);
+    }
+    let redirect = if options.same_origin_redirects {
+        reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            if attempt
+                .previous()
+                .first()
+                .is_some_and(|first| first.origin() != attempt.url().origin())
+            {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        })
+    } else {
+        reqwest::redirect::Policy::default()
+    };
     let client = Client::builder()
+        .default_headers(options.headers.clone())
+        .redirect(redirect)
         .user_agent(options.user_agent.clone())
         .pool_max_idle_per_host(options.connections.unwrap_or(32))
         .connect_timeout(Duration::from_secs(10))
@@ -214,7 +260,10 @@ pub async fn download_http(
         None,
     );
 
-    let probe = probe_server(&client, &url).await?;
+    let probe = tokio::select! {
+        result = probe_server(&client, &url) => result?,
+        _ = cancelled(&options) => return Err(DlError::Cancelled),
+    };
 
     if options.resume {
         if let Ok(Some(state)) = read_inline_state(&download_path).await {
@@ -222,18 +271,30 @@ pub async fn download_http(
                 if state.version == 1
                     && state.kind == DownloadKind::Http
                     && crate::types::urls_are_compatible(&state.source, &url)
+                    && state.resume_key == options.resume_key
                     && state.total_size == total_size
-                    && crate::types::weak_validator_matches(state.etag.as_deref(), probe.etag.as_deref())
-                    && crate::types::weak_validator_matches(state.last_modified.as_deref(), probe.last_modified.as_deref())
+                    && crate::types::weak_validator_matches(
+                        state.etag.as_deref(),
+                        probe.etag.as_deref(),
+                    )
+                    && crate::types::weak_validator_matches(
+                        state.last_modified.as_deref(),
+                        probe.last_modified.as_deref(),
+                    )
                 {
                     options.chunk_size = state.chunk_size;
-                    tracing::info!(chunk_size = options.chunk_size, "Adopting chunk size from existing download state");
+                    tracing::info!(
+                        chunk_size = options.chunk_size,
+                        "Adopting chunk size from existing download state"
+                    );
                 }
             }
         }
     }
 
-    let mut use_parallel = probe.ranges_supported && probe.total_size.is_some() && options.connections.map_or(true, |c| c > 1);
+    let mut use_parallel = probe.ranges_supported
+        && probe.total_size.is_some()
+        && options.connections.map_or(true, |c| c > 1);
 
     if use_parallel && options.resume {
         if let Ok(metadata) = fs::metadata(&download_path).await {
@@ -257,7 +318,8 @@ pub async fn download_http(
     if use_parallel {
         if let Some(total_size) = probe.total_size {
             if options.chunk_size == crate::types::DEFAULT_CHUNK_SIZE {
-                options.chunk_size = calculate_dynamic_chunk_size(total_size, options.connections.unwrap_or(8));
+                options.chunk_size =
+                    calculate_dynamic_chunk_size(total_size, options.connections.unwrap_or(8));
                 tracing::debug!(
                     total_size,
                     connections = ?options.connections,
@@ -268,7 +330,15 @@ pub async fn download_http(
         }
 
         tracing::debug!("Starting parallel download");
-        match download_parallel(url.clone(), download_path.clone(), options.clone(), client.clone(), probe.clone()).await {
+        match download_parallel(
+            url.clone(),
+            download_path.clone(),
+            options.clone(),
+            client.clone(),
+            probe.clone(),
+        )
+        .await
+        {
             Ok(mut summary) => {
                 fs::rename(&download_path, &target_path).await?;
                 summary.output_path = target_path;
@@ -279,7 +349,10 @@ pub async fn download_http(
                     tracing::warn!(error = %error, "Parallel download failed with retryable error; falling back to single stream");
                     if matches!(error, DlError::RateLimited { .. }) {
                         tracing::warn!("Waiting 3 seconds after rate limiting before single stream fallback...");
-                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(3)) => {},
+                            _ = cancelled(&options) => return Err(DlError::Cancelled),
+                        }
                     }
                 } else {
                     return Err(error);
@@ -296,27 +369,39 @@ pub async fn download_http(
         // 1. Try to read inline parallel state from the file
         if let Ok(Some(state)) = read_inline_state(&download_path).await {
             if let Some(total) = total_size {
-                if state.is_compatible_with(
-                    DownloadKind::Http,
-                    &url,
-                    total,
-                    options.chunk_size,
-                    probe.etag.as_deref(),
-                    probe.last_modified.as_deref(),
-                ) {
-                    start_offset = contiguous_completed_bytes(&state.completed_chunks, total, options.chunk_size);
-                    tracing::info!(start_offset, "Resuming single-stream download from parallel inline state");
+                if state.resume_key == options.resume_key
+                    && state.is_compatible_with(
+                        DownloadKind::Http,
+                        &url,
+                        total,
+                        options.chunk_size,
+                        probe.etag.as_deref(),
+                        probe.last_modified.as_deref(),
+                    )
+                {
+                    start_offset = contiguous_completed_bytes(
+                        &state.completed_chunks,
+                        total,
+                        options.chunk_size,
+                    );
+                    tracing::info!(
+                        start_offset,
+                        "Resuming single-stream download from parallel inline state"
+                    );
                 }
             }
         }
         // 2. If no parallel state, check if the file exists and ranges are supported
-        if start_offset == 0 && probe.ranges_supported {
+        if start_offset == 0 && probe.ranges_supported && options.resume_key.is_none() {
             if let Ok(metadata) = fs::metadata(&download_path).await {
                 let file_len = metadata.len();
                 if let Some(total) = total_size {
                     if file_len < total {
                         start_offset = file_len;
-                        tracing::info!(start_offset, "Resuming single-stream download from existing file length");
+                        tracing::info!(
+                            start_offset,
+                            "Resuming single-stream download from existing file length"
+                        );
                     }
                 }
             }
@@ -330,7 +415,15 @@ pub async fn download_http(
         }
     }
 
-    let mut summary = download_single_stream(url, download_path.clone(), options, client, probe, start_offset).await?;
+    let mut summary = download_single_stream(
+        url,
+        download_path.clone(),
+        options,
+        client,
+        probe,
+        start_offset,
+    )
+    .await?;
     fs::rename(&download_path, &target_path).await?;
     summary.output_path = target_path;
     Ok(summary)
@@ -366,12 +459,13 @@ async fn download_parallel(
                 options.chunk_size,
                 probe.etag.as_deref(),
                 probe.last_modified.as_deref(),
-            ) && state.completed_chunks.len() == total_chunks =>
+            ) && state.resume_key == options.resume_key
+                && state.completed_chunks.len() == total_chunks =>
         {
             resumed = true;
             completed_chunks = state.completed_chunks;
         }
-         _ => {}
+        _ => {}
     }
 
     let already_downloaded = completed_chunks
@@ -454,6 +548,7 @@ async fn download_parallel(
         etag: probe.etag,
         last_modified: probe.last_modified,
         extra_workers_to_stop: extra_workers_to_stop.clone(),
+        resume_key: options.resume_key.clone(),
     };
 
     let mut workers = JoinSet::new();
@@ -479,10 +574,14 @@ async fn download_parallel(
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         workers.abort_all();
+                        while workers.join_next().await.is_some() {}
+                        persist_worker_state(&context, true).await?;
                         return Err(error);
                     }
                     Err(error) => {
                         workers.abort_all();
+                        while workers.join_next().await.is_some() {}
+                        persist_worker_state(&context, true).await?;
                         return Err(error.into());
                     }
                 }
@@ -511,6 +610,11 @@ async fn download_parallel(
                     }
                 }
             }
+            _ = cancelled(&options) => {
+                ctrl_c_hit = true;
+                workers.abort_all();
+                break;
+            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Ctrl+C detected, shutting down workers and flushing state...");
                 ctrl_c_hit = true;
@@ -521,11 +625,9 @@ async fn download_parallel(
     }
 
     if ctrl_c_hit {
-        let _ = persist_worker_state(&context, true).await;
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "Download interrupted by user (Ctrl+C)"
-        ).into());
+        while workers.join_next().await.is_some() {}
+        persist_worker_state(&context, true).await?;
+        return Err(DlError::Cancelled);
     }
 
     emit_progress(
@@ -572,15 +674,22 @@ async fn run_worker(worker_id: usize, context: WorkerContext) -> Result<()> {
 
     loop {
         if context.extra_workers_to_stop.load(Ordering::Relaxed) > 0 {
-            let res = context.extra_workers_to_stop.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
-                if val > 0 {
-                    Some(val - 1)
-                } else {
-                    None
-                }
-            });
+            let res = context.extra_workers_to_stop.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |val| {
+                    if val > 0 {
+                        Some(val - 1)
+                    } else {
+                        None
+                    }
+                },
+            );
             if res.is_ok() {
-                tracing::info!(worker_id, "Shutting down worker as requested by dynamic adjustment");
+                tracing::info!(
+                    worker_id,
+                    "Shutting down worker as requested by dynamic adjustment"
+                );
                 return Ok(());
             }
         }
@@ -645,7 +754,7 @@ async fn download_segment(
     const MAX_ATTEMPTS: usize = 6;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let outcome = match send_range_request(&context.client, &context.url, segment).await {
+        let outcome = match send_range_request(context, segment).await {
             Ok(response) => stream_response_to_file(context, file, segment, response).await,
             Err(error) => Err(error),
         };
@@ -655,9 +764,7 @@ async fn download_segment(
             Err(error) if attempt < MAX_ATTEMPTS && is_error_retryable(&error) => {
                 let delay = match &error {
                     DlError::RateLimited { retry_after, .. } => {
-                        retry_after.unwrap_or_else(|| {
-                            Duration::from_secs(2 + attempt as u64)
-                        })
+                        retry_after.unwrap_or_else(|| Duration::from_secs(2 + attempt as u64))
                     }
                     _ => {
                         let base = 1000;
@@ -685,9 +792,21 @@ async fn download_segment(
 /// Sends a range request for `segment` and validates the response status. Returns the
 /// response with headers received (body not yet read), or a mapped error. This is the
 /// part that is prefetched/pipelined while a previous segment is still streaming.
-async fn send_range_request(client: &Client, url: &str, segment: &Segment) -> Result<Response> {
+async fn send_range_request(context: &WorkerContext, segment: &Segment) -> Result<Response> {
     let range = format!("bytes={}-{}", segment.start, segment.end);
-    let response = client.get(url).header(RANGE, range).send().await?;
+    let mut request = context.client.get(&context.url).header(RANGE, range);
+    if let Some(validator) = context
+        .etag
+        .as_deref()
+        .filter(|v| !v.starts_with("W/"))
+        .or(context.last_modified.as_deref())
+    {
+        request = request.header(reqwest::header::IF_RANGE, validator);
+    }
+    let response = request.send().await?;
+    if matches!(response.status().as_u16(), 401 | 403) {
+        return Err(DlError::HttpStatus(response.status().as_u16()));
+    }
 
     if response.status() != StatusCode::PARTIAL_CONTENT {
         let status = response.status();
@@ -699,7 +818,8 @@ async fn send_range_request(client: &Client, url: &str, segment: &Segment) -> Re
         .await;
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = headers.get(reqwest::header::RETRY_AFTER)
+            let retry_after = headers
+                .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok())
                 .map(Duration::from_secs);
@@ -714,6 +834,7 @@ async fn send_range_request(client: &Client, url: &str, segment: &Segment) -> Re
         }
     }
 
+    validate_content_range(&response, segment.start, segment.end, context.total_size)?;
     Ok(response)
 }
 
@@ -727,6 +848,11 @@ async fn stream_response_to_file(
     let mut writer = BufWriter::with_capacity(WRITE_BUFFER_CAPACITY, file);
 
     let mut written = 0_u64;
+    let mut accounting = AttemptAccounting {
+        counter: &context.downloaded,
+        bytes: 0,
+        committed: false,
+    };
     let mut stream = response.bytes_stream();
     let mut last_emitted_time = Instant::now();
     let mut chunk_counter = 0_u32;
@@ -745,7 +871,9 @@ async fn stream_response_to_file(
         writer.write_all(&chunk).await?;
         let current_downloaded = context
             .downloaded
-            .fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
+            .fetch_add(chunk.len() as u64, Ordering::Relaxed)
+            + chunk.len() as u64;
+        accounting.bytes += chunk.len() as u64;
 
         chunk_counter += 1;
         if chunk_counter % 32 == 0 {
@@ -776,6 +904,7 @@ async fn stream_response_to_file(
     }
 
     writer.flush().await?;
+    accounting.committed = true;
     Ok(())
 }
 
@@ -784,7 +913,7 @@ async fn persist_worker_state(context: &WorkerContext, sync_to_disk: bool) -> Re
     let completed_chunks = context.completed.lock().await.clone();
     let mut state = InlineDownloadState::new(
         DownloadKind::Http,
-        context.url.clone(),
+        resume_source(&context.url, context.resume_key.as_deref()),
         context.total_size,
         context.chunk_size,
         completed_chunks,
@@ -808,7 +937,14 @@ async fn persist_worker_state(context: &WorkerContext, sync_to_disk: bool) -> Re
         Some(context.total_chunks),
     );
 
-    write_inline_state(&context.output_path, context.total_size, &state, sync_to_disk).await
+    state.resume_key = context.resume_key.clone();
+    write_inline_state(
+        &context.output_path,
+        context.total_size,
+        &state,
+        sync_to_disk,
+    )
+    .await
 }
 
 async fn download_single_stream(
@@ -819,70 +955,108 @@ async fn download_single_stream(
     probe: HttpProbe,
     start_offset: u64,
 ) -> Result<DownloadSummary> {
-
-    let mut response = None;
-    const MAX_SINGLE_STREAM_ATTEMPTS: usize = 5;
-    for attempt in 1..=MAX_SINGLE_STREAM_ATTEMPTS {
-        let req = if start_offset > 0 && probe.ranges_supported {
-            client.get(&url).header(RANGE, format!("bytes={}-", start_offset))
-        } else {
-            client.get(&url)
-        };
-        let res = req.send().await;
-        match res {
-            Ok(resp) => {
-                let status = resp.status();
-                let expected_status = if start_offset > 0 && probe.ranges_supported {
-                    StatusCode::PARTIAL_CONTENT
-                } else {
-                    StatusCode::OK
-                };
-
-                if status == expected_status || (start_offset == 0 && status.is_success()) || status == StatusCode::OK {
-                    response = Some(resp);
-                    break;
-                } else {
-                    let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
-                    let retry_after = if is_rate_limited {
-                        resp.headers().get(reqwest::header::RETRY_AFTER)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .map(Duration::from_secs)
+    let get_response = async {
+        let mut response = None;
+        const MAX_SINGLE_STREAM_ATTEMPTS: usize = 5;
+        for attempt in 1..=MAX_SINGLE_STREAM_ATTEMPTS {
+            let req = if start_offset > 0 && probe.ranges_supported {
+                {
+                    let mut request = client
+                        .get(&url)
+                        .header(RANGE, format!("bytes={}-", start_offset));
+                    if let Some(validator) = probe
+                        .etag
+                        .as_deref()
+                        .filter(|v| !v.starts_with("W/"))
+                        .or(probe.last_modified.as_deref())
+                    {
+                        request = request.header(reqwest::header::IF_RANGE, validator);
+                    }
+                    request
+                }
+            } else {
+                client.get(&url)
+            };
+            let res = req.send().await;
+            match res {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let expected_status = if start_offset > 0 && probe.ranges_supported {
+                        StatusCode::PARTIAL_CONTENT
                     } else {
-                        None
-                    };
-                    let desc = describe_status(resp, "GET").await;
-                    let error = if is_rate_limited {
-                        DlError::RateLimited {
-                            message: desc,
-                            retry_after,
-                        }
-                    } else if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
-                        DlError::ServerError(desc)
-                    } else {
-                        DlError::InvalidResponse(desc)
+                        StatusCode::OK
                     };
 
-                    if attempt < MAX_SINGLE_STREAM_ATTEMPTS && is_error_retryable(&error) {
-                        let delay = match &error {
-                            DlError::RateLimited { retry_after, .. } => {
-                                retry_after.unwrap_or_else(|| {
-                                    let base = 2000;
+                    if status == expected_status
+                        || (start_offset == 0 && status.is_success())
+                        || status == StatusCode::OK
+                    {
+                        response = Some(resp);
+                        break;
+                    } else {
+                        let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
+                        let retry_after = if is_rate_limited {
+                            resp.headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .map(Duration::from_secs)
+                        } else {
+                            None
+                        };
+                        let desc = describe_status(resp, "GET").await;
+                        let error = if matches!(status.as_u16(), 401 | 403) {
+                            DlError::HttpStatus(status.as_u16())
+                        } else if is_rate_limited {
+                            DlError::RateLimited {
+                                message: desc,
+                                retry_after,
+                            }
+                        } else if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT
+                        {
+                            DlError::ServerError(desc)
+                        } else {
+                            DlError::InvalidResponse(desc)
+                        };
+
+                        if attempt < MAX_SINGLE_STREAM_ATTEMPTS && is_error_retryable(&error) {
+                            let delay = match &error {
+                                DlError::RateLimited { retry_after, .. } => retry_after
+                                    .unwrap_or_else(|| {
+                                        let base = 2000;
+                                        let ms = base * 2_u64.pow(attempt as u32 - 1);
+                                        Duration::from_millis(ms + get_jitter_ms())
+                                    })
+                                    .min(Duration::from_secs(30)),
+                                _ => {
+                                    let base = 1000;
                                     let ms = base * 2_u64.pow(attempt as u32 - 1);
                                     Duration::from_millis(ms + get_jitter_ms())
-                                }).min(Duration::from_secs(30))
-                            }
-                            _ => {
-                                let base = 1000;
-                                let ms = base * 2_u64.pow(attempt as u32 - 1);
-                                Duration::from_millis(ms + get_jitter_ms())
-                            }
-                        };
+                                }
+                            };
+                            tracing::warn!(
+                                attempt,
+                                delay_ms = delay.as_millis(),
+                                error = %error,
+                                "GET request failed, retrying after delay"
+                            );
+                            tokio::time::sleep(delay).await;
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let error = DlError::Http(err);
+                    if attempt < MAX_SINGLE_STREAM_ATTEMPTS {
+                        let base = 1000;
+                        let ms = base * 2_u64.pow(attempt as u32 - 1);
+                        let delay = Duration::from_millis(ms + get_jitter_ms());
                         tracing::warn!(
                             attempt,
                             delay_ms = delay.as_millis(),
                             error = %error,
-                            "GET request failed, retrying after delay"
+                            "GET request connection failed, retrying after delay"
                         );
                         tokio::time::sleep(delay).await;
                     } else {
@@ -890,33 +1064,34 @@ async fn download_single_stream(
                     }
                 }
             }
-            Err(err) => {
-                let error = DlError::Http(err);
-                if attempt < MAX_SINGLE_STREAM_ATTEMPTS {
-                    let base = 1000;
-                    let ms = base * 2_u64.pow(attempt as u32 - 1);
-                    let delay = Duration::from_millis(ms + get_jitter_ms());
-                    tracing::warn!(
-                        attempt,
-                        delay_ms = delay.as_millis(),
-                        error = %error,
-                        "GET request connection failed, retrying after delay"
-                    );
-                    tokio::time::sleep(delay).await;
-                } else {
-                    return Err(error);
-                }
-            }
         }
-    }
 
-    let response = response.expect("response must be some on success");
+        Ok::<_, DlError>(response.expect("response must be some on success"))
+    };
+    let response = tokio::select! {
+        result = get_response => result?,
+        _ = cancelled(&options) => return Err(DlError::Cancelled),
+    };
+    if matches!(response.status().as_u16(), 401 | 403) {
+        return Err(DlError::HttpStatus(response.status().as_u16()));
+    }
     let actual_start_offset = if response.status() == StatusCode::PARTIAL_CONTENT {
         start_offset
     } else {
         0
     };
 
+    if response.status() == StatusCode::PARTIAL_CONTENT {
+        let total = probe
+            .total_size
+            .ok_or_else(|| DlError::InvalidResponse("missing range total".into()))?;
+        validate_content_range(
+            &response,
+            actual_start_offset,
+            total.saturating_sub(1),
+            total,
+        )?;
+    }
     let mut inner_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -924,7 +1099,9 @@ async fn download_single_stream(
         .await?;
 
     if actual_start_offset > 0 {
-        inner_file.seek(SeekFrom::Start(actual_start_offset)).await?;
+        inner_file
+            .seek(SeekFrom::Start(actual_start_offset))
+            .await?;
     } else {
         inner_file.set_len(0).await?;
     }
@@ -933,7 +1110,9 @@ async fn download_single_stream(
 
     let mut downloaded = actual_start_offset;
     let total_size = probe.total_size.or_else(|| {
-        response.content_length().map(|len| len + actual_start_offset)
+        response
+            .content_length()
+            .map(|len| len + actual_start_offset)
     });
     let mut stream = response.bytes_stream();
     let mut last_emitted_time = Instant::now();
@@ -969,6 +1148,10 @@ async fn download_single_stream(
                     }
                 }
             }
+            _ = cancelled(&options) => {
+                ctrl_c_hit = true;
+                break;
+            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Ctrl+C detected, flushing file and shutting down...");
                 ctrl_c_hit = true;
@@ -981,12 +1164,33 @@ async fn download_single_stream(
     file.get_ref().sync_data().await?;
 
     if ctrl_c_hit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "Download interrupted by user (Ctrl+C)"
-        ).into());
+        if let Some(total) = total_size {
+            let mut state = InlineDownloadState::new(
+                DownloadKind::Http,
+                resume_source(&url, options.resume_key.as_deref()),
+                total,
+                options.chunk_size,
+                (0..chunk_count(total, options.chunk_size))
+                    .map(|i| {
+                        (i as u64 * options.chunk_size + segment_len(i, total, options.chunk_size))
+                            <= downloaded
+                    })
+                    .collect(),
+                probe.etag.clone(),
+                probe.last_modified.clone(),
+            );
+            state.resume_key = options.resume_key.clone();
+            drop(file);
+            write_inline_state(&output_path, total, &state, true).await?;
+        }
+        return Err(DlError::Cancelled);
     }
 
+    if total_size.is_some_and(|total| downloaded != total) {
+        return Err(DlError::InvalidResponse(
+            "payload size differs from Content-Length".into(),
+        ));
+    }
     emit_progress(
         &options.progress,
         DownloadPhase::Complete,
@@ -1069,7 +1273,7 @@ async fn probe_server(client: &Client, url: &str) -> Result<HttpProbe> {
         return Ok(probe);
     }
 
-    Ok(probe)
+    Err(DlError::HttpStatus(response.status().as_u16()))
 }
 
 async fn describe_status(response: Response, context: &str) -> String {
@@ -1351,7 +1555,9 @@ mod tests {
             Some("\"test\"".to_string()),
             None,
         );
-        crate::state::write_inline_state(&output_dl, data.len() as u64, &state, true).await.unwrap();
+        crate::state::write_inline_state(&output_dl, data.len() as u64, &state, true)
+            .await
+            .unwrap();
 
         let summary = download_http(
             format!("{base_url}/resume_test.bin"),
@@ -1453,7 +1659,9 @@ mod tests {
             Some("\"test\"".to_string()),
             None,
         );
-        crate::state::write_inline_state(&output_dl, data.len() as u64, &state, true).await.unwrap();
+        crate::state::write_inline_state(&output_dl, data.len() as u64, &state, true)
+            .await
+            .unwrap();
 
         // Download without specifying chunk_size (so it defaults to DEFAULT_CHUNK_SIZE which is 2M).
         // It should adopt the chunk_size (128K) from the existing state!
@@ -1529,7 +1737,10 @@ mod tests {
                 saw_parallel = true;
             }
         }
-        assert!(saw_parallel, "Should have run parallel download with multiple workers");
+        assert!(
+            saw_parallel,
+            "Should have run parallel download with multiple workers"
+        );
 
         let _ = shutdown.send(());
     }
@@ -1570,7 +1781,10 @@ mod tests {
                 saw_parallel = true;
             }
         }
-        assert!(saw_parallel, "Should have run parallel download with dynamic workers");
+        assert!(
+            saw_parallel,
+            "Should have run parallel download with dynamic workers"
+        );
 
         let _ = shutdown.send(());
     }
@@ -1716,20 +1930,91 @@ mod tests {
     fn test_calculate_dynamic_chunk_size() {
         // Test very small files (< 10MB)
         assert_eq!(calculate_dynamic_chunk_size(4 * 1024 * 1024, 8), 512 * 1024); // 4MB / 16 = 256KB -> capped at min 512KB
-        assert_eq!(calculate_dynamic_chunk_size(4 * 1024 * 1024, 1), 2 * 1024 * 1024); // 4MB / 2 = 2MB
+        assert_eq!(
+            calculate_dynamic_chunk_size(4 * 1024 * 1024, 1),
+            2 * 1024 * 1024
+        ); // 4MB / 2 = 2MB
 
         // Test small-to-medium files (10MB - 100MB)
-        assert_eq!(calculate_dynamic_chunk_size(40 * 1024 * 1024, 8), (2.5 * 1024.0 * 1024.0) as u64); // 40MB / 16 = 2.5MB
-        assert_eq!(calculate_dynamic_chunk_size(80 * 1024 * 1024, 4), 8 * 1024 * 1024); // 80MB / 8 = 10MB -> capped at max 8MB
+        assert_eq!(
+            calculate_dynamic_chunk_size(40 * 1024 * 1024, 8),
+            (2.5 * 1024.0 * 1024.0) as u64
+        ); // 40MB / 16 = 2.5MB
+        assert_eq!(
+            calculate_dynamic_chunk_size(80 * 1024 * 1024, 4),
+            8 * 1024 * 1024
+        ); // 80MB / 8 = 10MB -> capped at max 8MB
 
         // Test medium files (100MB - 1GB)
-        assert_eq!(calculate_dynamic_chunk_size(500 * 1024 * 1024, 8), 16 * 1024 * 1024); // 500MB / 16 = 31.25MB -> capped at max 16MB
+        assert_eq!(
+            calculate_dynamic_chunk_size(500 * 1024 * 1024, 8),
+            16 * 1024 * 1024
+        ); // 500MB / 16 = 31.25MB -> capped at max 16MB
 
         // Test large files (1GB - 10GB)
-        assert_eq!(calculate_dynamic_chunk_size(4 * 1024 * 1024 * 1024, 8), 32 * 1024 * 1024); // 4GB / 16 = 256MB -> capped at max 32MB
+        assert_eq!(
+            calculate_dynamic_chunk_size(4 * 1024 * 1024 * 1024, 8),
+            32 * 1024 * 1024
+        ); // 4GB / 16 = 256MB -> capped at max 32MB
 
         // Test very large files (>= 10GB)
-        assert_eq!(calculate_dynamic_chunk_size(10 * 1024 * 1024 * 1024, 8), 64 * 1024 * 1024); // 10GB / 16 = 625MB -> capped at max 64MB
-        assert_eq!(calculate_dynamic_chunk_size(20 * 1024 * 1024 * 1024, 8), 64 * 1024 * 1024); // 20GB / 16 = 1.25GB -> capped at max 64MB
+        assert_eq!(
+            calculate_dynamic_chunk_size(10 * 1024 * 1024 * 1024, 8),
+            64 * 1024 * 1024
+        ); // 10GB / 16 = 625MB -> capped at max 64MB
+        assert_eq!(
+            calculate_dynamic_chunk_size(20 * 1024 * 1024 * 1024, 8),
+            64 * 1024 * 1024
+        ); // 20GB / 16 = 1.25GB -> capped at max 64MB
+    }
+}
+
+async fn cancelled(options: &DownloadOptions) {
+    match &options.cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn validate_content_range(response: &Response, start: u64, end: u64, total: u64) -> Result<()> {
+    let expected = format!("bytes {start}-{end}/{total}");
+    if response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        != Some(expected.as_str())
+    {
+        return Err(DlError::RangeMismatch);
+    }
+    Ok(())
+}
+
+struct AttemptAccounting<'a> {
+    counter: &'a AtomicU64,
+    bytes: u64,
+    committed: bool,
+}
+
+impl Drop for AttemptAccounting<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.counter.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+fn resume_source(source: &str, key: Option<&str>) -> String {
+    if key.is_none() {
+        return source.to_string();
+    }
+    match url::Url::parse(source) {
+        Ok(mut url) => {
+            url.set_query(None);
+            url.set_fragment(None);
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.into()
+        }
+        Err(_) => String::new(),
     }
 }

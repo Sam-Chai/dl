@@ -1,5 +1,5 @@
 [workspace]
-members = ["libdl", "dl-cli"]
+members = ["libdl", "dl-cli", "json-dl"]
 resolver = "2"
 
 [workspace.package]

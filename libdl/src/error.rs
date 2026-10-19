@@ -2,6 +2,15 @@ use std::io;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DlError {
+    #[error("unexpected Content-Range")]
+    RangeMismatch,
+
+    #[error("download cancelled")]
+    Cancelled,
+
+    #[error("HTTP status {0}")]
+    HttpStatus(u16),
+
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
