@@ -83,7 +83,7 @@ jobs:
           tar -xzf inputs/json-dl-aarch64-apple-darwin/*.tar.gz -C universal/aarch64
           lipo -create universal/x86_64/json-dl universal/aarch64/json-dl -output universal/json-dl
           codesign --force --sign - universal/json-dl
-          lipo -verify_arch x86_64 arm64 universal/json-dl
+          lipo universal/json-dl -verify_arch x86_64 arm64
           codesign --verify --strict universal/json-dl
           python scripts/test-json-dl.py universal/json-dl
           python scripts/package-json-dl.py --target universal-apple-darwin --binary universal/json-dl
