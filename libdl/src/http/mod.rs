@@ -1845,6 +1845,14 @@ mod tests {
 
         let range = parse_range_header(&request);
 
+        // Keep range requests in flight long enough for concurrency assertions;
+        // loopback responses can otherwise finish between progress samples.
+        if (request.contains("/pre_allocated.bin") || request.contains("/dynamic_test.bin"))
+            && matches!(range, Some((_, Some(end))) if end > 0)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
         if request.contains("/rate-limited.bin") {
             if let Some((start, end_opt)) = range {
                 let end = end_opt.unwrap_or(0);
