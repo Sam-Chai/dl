@@ -431,8 +431,10 @@ async fn run(cli: Cli) -> Result<Value, Failure> {
         }
         Ok(()) // EOF is not cancellation; a parent may close stdin after sending its request.
     });
-    let mut result = transfer(request, cancellation).await;
-    if control.is_finished() {
+    let mut result = transfer(request, cancellation.clone()).await;
+    // Cancellation wakes transfer before the control task necessarily finishes.
+    // Join that task so its protocol error takes precedence over cancellation.
+    if cancellation.is_cancelled() || control.is_finished() {
         if let Ok(Err(error)) = control.await {
             result = Err(error);
         }
